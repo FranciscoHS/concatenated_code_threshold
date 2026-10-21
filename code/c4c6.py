@@ -667,6 +667,294 @@ def estimate_logical_cnot_error_l2(p,num_shots):
 
     return logical_error_l2, variance_l2
 
+# ---------------------------------------------------------------------------
+# Error correction by measuring stabilizers with single-qubit ancillas
+# (alternative to Knill's teleportation-based EC; hook errors are not handled)
+# ---------------------------------------------------------------------------
+
+# Logical operators of a C4 block, consistent with decode_measurement_c4
+ZL_c4 = [[0,2],[2,3]]
+XL_c4 = [[0,1],[1,3]]
+
+# C6 stabilizers on the 6 level-1 logical qubits (identical supports for X and Z type)
+S_c6 = [[0,1,2,5],[0,3,4,5]]
+
+# Data qubit i of C4 block j is paired with ancilla qubit PERM[j][i] in the transversal CNOT.
+# The relabeling acts as a logical gate on the pair, so that ancilla logical 1 accumulates S1
+# and ancilla logical 2 accumulates S2.
+PERM_Z_CHECK = [[0,3,1,2],[0,1,2,3],[0,2,3,1]]
+PERM_X_CHECK = [[0,2,3,1],[0,1,2,3],[0,3,1,2]]
+
+def build_lookup_c6():
+    # (erased pair, syndrome change) -> correction on the two level-1 qubits of that pair
+    lookup = {}
+    for j in range(3):
+        for u in range(2):
+            for v in range(2):
+                flip = [0]*6
+                flip[2*j], flip[2*j+1] = u, v
+                syndrome = tuple(sum(flip[k] for k in s)%2 for s in S_c6)
+                lookup[(j, syndrome)] = (u, v)
+    return lookup
+
+LOOKUP_C6 = build_lookup_c6()
+
+def append_noisy_stabilizer_ec_c4(circuit, loc, anc, p):
+    # Measure ZZZZ then XXXX on the C4 block at loc, reusing the ancilla qubit anc.
+    # Returns the measurement indices [ZZZZ, XXXX].
+    circuit.append("R", anc)
+    circuit.append("X_ERROR", anc, p)
+    for i in range(N_c4):
+        circuit.append("CNOT", [loc+i, anc])
+        circuit.append("DEPOLARIZE2", [loc+i, anc], p)
+    circuit.append("X_ERROR", anc, p)
+    m_z = circuit.num_measurements
+    circuit.append("M", anc)
+
+    circuit.append("R", anc)
+    circuit.append("X_ERROR", anc, p)
+    circuit.append("H", anc)
+    for i in range(N_c4):
+        circuit.append("CNOT", [anc, loc+i])
+        circuit.append("DEPOLARIZE2", [anc, loc+i], p)
+    circuit.append("H", anc)
+    circuit.append("X_ERROR", anc, p)
+    m_x = circuit.num_measurements
+    circuit.append("M", anc)
+
+    return [m_z, m_x]
+
+def append_noisy_c4_block_prep(circuit, loc, p, basis='z'):
+    # |00> (basis='z') or |++> (basis='x') of the C4 block at loc
+    for i in range(N_c4):
+        circuit.append("R", loc+i)
+        circuit.append("X_ERROR", loc+i, p)
+    circuit.append("H", loc)
+    for i in range(1, N_c4):
+        circuit.append("CNOT", [loc, loc+i])
+        circuit.append("DEPOLARIZE2", [loc, loc+i], p)
+    if basis == 'x':
+        for i in range(N_c4):
+            circuit.append("H", loc+i)
+
+def append_noisy_c4_block_m(circuit, loc, p, basis='z'):
+    # Transversal measurement of the C4 block at loc. Returns the index of the first measurement.
+    if basis == 'x':
+        for i in range(N_c4):
+            circuit.append("H", loc+i)
+    for i in range(N_c4):
+        circuit.append("X_ERROR", loc+i, p)
+    m_start = circuit.num_measurements
+    for i in range(N_c4):
+        circuit.append("M", loc+i)
+    return m_start
+
+def append_noisy_stabilizer_ec_c6(circuit, loc, anc_block, anc, p):
+    # Level-1 EC on the three C4 blocks of the C6 block at loc, then the C6 checks:
+    # S1 and S2 are collected on the two logical qubits of one ancilla C4 block.
+    record = {'c4': [append_noisy_stabilizer_ec_c4(circuit, loc+N_c4*j, anc, p) for j in range(3)]}
+
+    for basis, perm in (('z', PERM_Z_CHECK), ('x', PERM_X_CHECK)):
+        append_noisy_c4_block_prep(circuit, anc_block, p, basis)
+        record['anc_ec_'+basis] = append_noisy_stabilizer_ec_c4(circuit, anc_block, anc, p)
+        for j in range(3):
+            for i in range(N_c4):
+                data_qubit = loc+N_c4*j+i
+                anc_qubit = anc_block+perm[j][i]
+                if basis == 'z':
+                    circuit.append("CNOT", [data_qubit, anc_qubit])
+                else:
+                    circuit.append("CNOT", [anc_qubit, data_qubit])
+                circuit.append("DEPOLARIZE2", [data_qubit, anc_qubit], p)
+        record[basis] = append_noisy_c4_block_m(circuit, anc_block, p, basis)
+
+    return record
+
+def decode_c4_block(sample, m_start, basis='z'):
+    # Vectorized over shots: logical values of a measured C4 block and whether its parity check failed
+    m = sample[:, m_start:m_start+N_c4].astype(int)
+    L = ZL_c4 if basis == 'z' else XL_c4
+    logical = np.stack([m[:, L[0]].sum(1)%2, m[:, L[1]].sum(1)%2], axis=1)
+    detected = m.sum(1)%2 == 1
+    return logical, detected
+
+def count_logical_errors(outcome):
+    # outcome: (shots, 4 blocks, 2 logicals) with -1 for erased; same weighting as accept()
+    num_errors = np.zeros(outcome.shape[0])
+    for a in range(2):
+        flag = np.ones(outcome.shape[0])
+        flag[(outcome[:, :, a] == 1).any(1)] = 0
+        flag *= 0.5**(outcome[:, :, a] == -1).sum(1)
+        num_errors += 1-flag
+    return num_errors
+
+# Estimate the logical error rate of level-1 with stabilizer-measurement EC
+def estimate_logical_cnot_error_l1_stabilizer(p,num_shots):
+    N_prev=1
+    N_now=N_c4
+
+    Q=10
+
+    loc = [0, 4, 8, 12]   # data 1, reference 1, data 2, reference 2
+    anc = 16
+
+    circuit = stim.Circuit()
+
+    #Prepare ideal Bell pairs
+    for l in loc:
+        append_0prep(circuit,l,N_prev,N_now)
+    append_h(circuit,loc[0],N_prev,N_now)
+    append_h(circuit,loc[2],N_prev,N_now)
+    append_cnot(circuit,loc[0],loc[1],N_prev,N_now)
+    append_cnot(circuit,loc[2],loc[3],N_prev,N_now)
+
+    #error-free CNOT + noisy CNOT+EC gadget
+    list_syndrome=[]
+    for q in range(Q):
+        append_cnot(circuit,loc[0],loc[2],N_prev,N_now)
+        append_noisy_cnot(circuit,loc[0],loc[2],N_prev,N_now,p)
+        list_syndrome.extend(append_noisy_stabilizer_ec_c4(circuit,loc[0],anc,p))
+        list_syndrome.extend(append_noisy_stabilizer_ec_c4(circuit,loc[2],anc,p))
+
+    append_cnot(circuit,loc[0],loc[1],N_prev,N_now)
+    append_cnot(circuit,loc[2],loc[3],N_prev,N_now)
+    append_h(circuit,loc[0],N_prev,N_now)
+    append_h(circuit,loc[2],N_prev,N_now)
+    list_m=[append_noisy_c4_block_m(circuit,l,0) for l in loc]
+
+    sample = circuit.compile_sampler().sample(shots=num_shots)
+
+    # C4 only detects errors: post-select on all syndromes being trivial
+    sample = sample[~sample[:, list_syndrome].any(1)]
+    num=len(sample)
+
+    outcome = np.zeros([num,4,2])
+    for i, m_start in enumerate(list_m):
+        logical, detected = decode_c4_block(sample, m_start)
+        outcome[:, i, :] = logical
+        outcome[detected, i, :] = -1
+
+    err = count_logical_errors(outcome).sum()
+
+    logical_error_l1=err/(num*Q*2)
+    variance_l1=err/(num*Q*2)**2
+
+    return logical_error_l1, variance_l1, num/num_shots
+
+# Estimate the logical error rate of level-2 with stabilizer-measurement EC and lookup-table decoding
+def estimate_logical_cnot_error_l2_stabilizer(p,num_shots):
+    global detector_now
+
+    detector_now=0
+
+    N_prev=N_c4
+    N_now=N_c6
+    n_now=3
+
+    Q=10
+
+    loc = [0, 6, 12, 18]   # in units of C4 blocks: data 1, reference 1, data 2, reference 2
+    anc_block = 30*N_c4
+    anc = 31*N_c4
+
+    circuit = stim.Circuit()
+
+    #Prepare ideal Bell pairs
+    for l in loc:
+        append_noisy_0prep(circuit,l,24,N_prev,N_now,0)
+    append_h(circuit,loc[0],N_prev,n_now)
+    append_h(circuit,loc[2],N_prev,n_now)
+    append_cnot(circuit,loc[0],loc[1],N_prev,n_now)
+    append_cnot(circuit,loc[2],loc[3],N_prev,n_now)
+
+    #error-free CNOT + noisy CNOT+EC gadget
+    list_record=[]
+    for q in range(Q):
+        append_cnot(circuit,loc[0],loc[2],N_prev,n_now)
+        append_noisy_cnot(circuit,loc[0],loc[2],N_prev,n_now,p)
+        list_record.append([append_noisy_stabilizer_ec_c6(circuit,l*N_c4,anc_block,anc,p) for l in (loc[0], loc[2])])
+
+    append_cnot(circuit,loc[0],loc[1],N_prev,n_now)
+    append_cnot(circuit,loc[2],loc[3],N_prev,n_now)
+    append_h(circuit,loc[0],N_prev,n_now)
+    append_h(circuit,loc[2],N_prev,n_now)
+    list_m=[[append_noisy_c4_block_m(circuit,(l+j)*N_c4,0) for j in range(3)] for l in loc]
+
+    sample = circuit.compile_sampler().sample(shots=num_shots)
+    shots = len(sample)
+
+    # Round-by-round decoding of each data block, tracking a Pauli frame on the level-1 qubits.
+    # basis 'z' checks find X errors (frame_x), basis 'x' checks find Z errors (frame_z).
+    reject = np.zeros(shots, dtype=bool)
+    frame = {(b, basis): np.zeros([shots,6], dtype=int) for b in range(2) for basis in 'zx'}
+    for b in range(2):
+        for basis, c4_index in (('z',0), ('x',1)):
+            prev_c4 = np.zeros([shots,3], dtype=bool)
+            prev_syndrome = np.zeros([shots,2], dtype=int)
+            for q in range(Q):
+                record = list_record[q][b]
+                c4_syndrome = sample[:, [record['c4'][j][c4_index] for j in range(3)]]
+                erased = c4_syndrome != prev_c4
+                prev_c4 = c4_syndrome
+
+                # Discard if the ancilla block was prepared with a detected error. A failed parity check
+                # in the ancilla readout is not a reason to discard: data errors are copied onto the
+                # ancilla block, which is how they are detected.
+                reject |= sample[:, record['anc_ec_'+basis]].any(1)
+                syndrome, _ = decode_c4_block(sample, record[basis], basis)
+
+                change = syndrome ^ prev_syndrome
+                prev_syndrome = syndrome
+                has_change = change.any(1)
+                num_erased = erased.sum(1)
+                reject |= has_change & (num_erased != 1)
+
+                for j in range(3):
+                    for s in ((0,1),(1,0),(1,1)):
+                        hit = has_change & (num_erased == 1) & erased[:, j] & (change[:,0] == s[0]) & (change[:,1] == s[1])
+                        u, v = LOOKUP_C6[(j, s)]
+                        frame[(b, basis)][hit, 2*j] ^= u
+                        frame[(b, basis)][hit, 2*j+1] ^= v
+
+    keep = ~reject
+    sample = sample[keep]
+    num = len(sample)
+
+    # Level-1 readout of the four blocks, then apply the frame: an X error on a data block flips
+    # its reference block, a Z error on a data block flips the data block itself (after the final H)
+    level1 = np.zeros([num,4,6], dtype=int)
+    erased = np.zeros([num,4,3], dtype=bool)
+    for i in range(4):
+        for j in range(3):
+            logical, detected = decode_c4_block(sample, list_m[i][j])
+            level1[:, i, 2*j:2*j+2] = logical
+            erased[:, i, j] = detected
+    for b in range(2):
+        level1[:, 2*b+1, :] ^= frame[(b,'z')][keep]
+        level1[:, 2*b, :] ^= frame[(b,'x')][keep] @ FINAL_H_Z_FLIP % 2
+
+    outcome = np.zeros([num,4,2])
+    for s in range(num):
+        for i in range(4):
+            M = [-1 if erased[s,i,k//2] else level1[s,i,k] for k in range(6)]
+            outcome[s,i,:] = decode_measurement_c6(M)
+
+    err = count_logical_errors(outcome).sum()
+
+    logical_error_l2=err/(num*Q*2)
+    variance_l2=err/(num*Q*2)**2
+
+    return logical_error_l2, variance_l2, num/shots
+
+# Row k: level-1 readout bits of a data block flipped by a Z error on its level-1 qubit k,
+# after the final logical H (up to C6 stabilizers)
+FINAL_H_Z_FLIP = np.array([[0,0,1,0,0,1],
+                           [0,0,0,1,1,1],
+                           [0,0,1,1,0,0],
+                           [0,0,1,0,0,0],
+                           [0,0,0,0,1,1],
+                           [0,0,0,0,1,0]])
+
 if __name__ == '__main__':
     output_file_name = str(sys.argv[1])
     num_shots = int(sys.argv[2])
@@ -674,6 +962,7 @@ if __name__ == '__main__':
     p = float(sys.argv[4])
     error_model = str(sys.argv[5])
     l = int(sys.argv[6])
+    ec_method = str(sys.argv[7]) if len(sys.argv) > 7 else 'knill'
 
     if error_model == 'a':
         gamma = p/10
@@ -688,16 +977,27 @@ if __name__ == '__main__':
     check_matrix = [[1, 1, 1, 1]]
     if l!=1 and l!=2:
         print('l should be 1 or 2!')
+    elif ec_method!='knill' and ec_method!='stabilizer':
+        print('ec_method should be knill or stabilizer!')
     else:
-        if l==1:
-            logical_error, variance = estimate_logical_cnot_error_l1(p,num_shots)
-        elif l==2:
-            logical_error, variance = estimate_logical_cnot_error_l2(p,num_shots)
+        acceptance = None
+        if ec_method=='knill':
+            if l==1:
+                logical_error, variance = estimate_logical_cnot_error_l1(p,num_shots)
+            elif l==2:
+                logical_error, variance = estimate_logical_cnot_error_l2(p,num_shots)
+        else:
+            if l==1:
+                logical_error, variance, acceptance = estimate_logical_cnot_error_l1_stabilizer(p,num_shots)
+            elif l==2:
+                logical_error, variance, acceptance = estimate_logical_cnot_error_l2_stabilizer(p,num_shots)
         with open(output_file_name, 'a') as file:
             output_data = {
                 'physical_error': p,
                 'logical_error': logical_error,
                 'variance': variance
             }
+            if acceptance is not None:
+                output_data['acceptance'] = acceptance
             file.write('\"case' + str(case_number) + '\":' + json.dumps(output_data) +',\n')
         

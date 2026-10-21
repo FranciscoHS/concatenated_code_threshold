@@ -17,8 +17,8 @@ def run_script(arg):
         print(e.stderr)
 
 if __name__ == '__main__':
-    if len(sys.argv)<2 or (sys.argv[1]=='hamming_code.py' and len(sys.argv) != 8) or (sys.argv[1]!='hamming_code.py' and len(sys.argv) != 7):
-        print('parallel_execution.py [script_name] [num_shots] [starting_p] [num_p] [error_model] [parameter1] [parameter2 (if script_name==\'hamming_code.py\')]')
+    if len(sys.argv)<2 or (sys.argv[1]=='hamming_code.py' and len(sys.argv) != 8) or (sys.argv[1]=='c4c6.py' and len(sys.argv) not in (7, 8)) or (sys.argv[1] not in ('hamming_code.py', 'c4c6.py') and len(sys.argv) != 7):
+        print('parallel_execution.py [script_name] [num_shots] [starting_p] [num_p] [error_model] [parameter1] [parameter2 (if script_name==\'hamming_code.py\')] [ec_method (optional, if script_name==\'c4c6.py\': knill or stabilizer)]')
         exit(0)
     script_name = str(sys.argv[1])
     num_shots = int(sys.argv[2])
@@ -34,6 +34,10 @@ if __name__ == '__main__':
     if script_name=='hamming_code.py':
         output_file_name = f'../data/hamming_code/output_{os.path.splitext(os.path.basename(script_name))[0]}_{str(2**parameter[0]-1)}qubit_below_{str(2**parameter[1]-1)}qubit_error_model_{str(error_model)}_{num_shots}runs.json'
         arg_list = [[script_name, output_file_name, num_shots, i, error_list[i], error_model, parameter[0], parameter[1]] for i in range(num_p)]
+    elif script_name=='c4c6.py' and len(sys.argv)==8 and sys.argv[7]!='knill':
+        ec_method = str(sys.argv[7])
+        output_file_name = f'../data/underlying_code/output_{os.path.splitext(os.path.basename(script_name))[0]}_{ec_method}_level{str(parameter[0])}_error_model_{str(error_model)}_{num_shots}runs.json'
+        arg_list = [[script_name, output_file_name, num_shots, i, error_list[i], error_model, parameter[0], ec_method] for i in range(num_p)]
     else:
         output_file_name = f'../data/underlying_code/output_{os.path.splitext(os.path.basename(script_name))[0]}_level{str(parameter[0])}_error_model_{str(error_model)}_{num_shots}runs.json'
         arg_list = [[script_name, output_file_name, num_shots, i, error_list[i], error_model, parameter[0]] for i in range(num_p)]
